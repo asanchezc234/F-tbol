@@ -1,24 +1,38 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import os
+import re
 import secrets
-from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from sqlmodel import select
 
 from app.db import get_session, init_db
 from app.models import Match, MatchType, Player, Signup, capacity_for
-from app.whatsapp_parser import build_roster_from_messages, parse_whatsapp_export
 
 
-app = FastAPI(title="Reservas Fútbol")
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
-templates = Jinja2Templates(directory="app/templates")
+# Importar modelos antes de init_db (registro en SQLModel.metadata).
+app = FastAPI(title="Reservas Fútbol API")
+
+# CORS para dev (React en :5173)
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[frontend_origin],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -26,11 +40,7 @@ def _startup() -> None:
     init_db()
 
 
-def _flash_from_request(request: Request) -> Optional[str]:
-    return request.query_params.get("flash")
-
-
-def _parse_scheduled_at(raw: str) -> Optional[datetime]:
+def _parse_scheduled_at(raw: Optional[str]) -> Optional[datetime]:
     s = (raw or "").strip()
     if not s:
         return None
@@ -39,26 +49,44 @@ def _parse_scheduled_at(raw: str) -> Optional[datetime]:
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
-    return None
+    raise HTTPException(status_code=400, detail="scheduled_at inválido. Usá YYYY-MM-DD HH:MM")
 
 
-def _new_join_code() -> str:
-    # Corto y fácil de escribir/compartir
-    return secrets.token_hex(4)
+def _new_join_code(session) -> str:
+    code = secrets.token_hex(4)
+    while session.exec(select(Match).where(Match.join_code == code)).first():
+        code = secrets.token_hex(4)
+    return code
 
 
-def _get_or_create_player(session, *, name: str, whatsapp_display_name: Optional[str] = None) -> Player:
+def _get_or_create_player(session, *, name: str, phone: Optional[str] = None, whatsapp_display_name: Optional[str] = None) -> Player:
     name_clean = name.strip()
+
+    if phone:
+        by_phone = session.exec(select(Player).where(Player.phone == phone)).first()
+        if by_phone:
+            if whatsapp_display_name and not by_phone.whatsapp_display_name:
+                by_phone.whatsapp_display_name = whatsapp_display_name
+                session.add(by_phone)
+                session.commit()
+                session.refresh(by_phone)
+            if name_clean and by_phone.name != name_clean:
+                # No pisamos el nombre si ya existe uno “mejor”
+                pass
+            return by_phone
+
     existing = session.exec(select(Player).where(Player.name == name_clean)).first()
     if existing:
+        if phone and not existing.phone:
+            existing.phone = phone
         if whatsapp_display_name and not existing.whatsapp_display_name:
             existing.whatsapp_display_name = whatsapp_display_name
-            session.add(existing)
-            session.commit()
-            session.refresh(existing)
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
         return existing
 
-    p = Player(name=name_clean, whatsapp_display_name=whatsapp_display_name)
+    p = Player(name=name_clean or (phone or "Jugador"), whatsapp_display_name=whatsapp_display_name, phone=phone)
     session.add(p)
     session.commit()
     session.refresh(p)
@@ -70,346 +98,185 @@ def _count_active_signups(session, match_id: int) -> int:
     return len(rows)
 
 
-def _render_whatsapp_text(
-    title: str,
-    match_type: MatchType,
-    capacity: int,
-    signups: list[dict[str, Any]],
-    *,
-    join_url: str,
-) -> str:
-    lines = [
-        f"LISTA {title} ({match_type.value}) {len([s for s in signups if not s['is_cancelled']])}/{capacity}",
-        "",
-    ]
-    i = 1
-    for s in signups:
-        if s["is_cancelled"]:
-            continue
-        paid = "✅" if s["is_paid"] else "💸"
-        lines.append(f"{i}. {s['player_name']} {paid}")
-        i += 1
-    lines.append("")
-    lines.append(f"Link para apuntarse: {join_url}")
-    lines.append("Responde con: 'me apunto' o '+1' para entrar en la lista (o usa el link).")
-    return "\n".join(lines)
+def _signup_view(session, s: Signup) -> dict[str, Any]:
+    p = session.get(Player, s.player_id)
+    return {
+        "id": s.id,
+        "playerId": s.player_id,
+        "playerName": p.name if p else f"Player #{s.player_id}",
+        "isPaid": bool(s.is_paid),
+        "isCancelled": bool(s.is_cancelled),
+        "notes": s.notes,
+        "joinedAt": s.joined_at.isoformat(),
+    }
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request) -> HTMLResponse:
+class MatchCreateIn(BaseModel):
+    title: str = Field(..., min_length=1)
+    matchType: MatchType
+    scheduledAt: Optional[str] = None
+
+
+class SignupCreateIn(BaseModel):
+    name: str = Field(..., min_length=1)
+    notes: Optional[str] = None
+
+
+class SignupPatchIn(BaseModel):
+    isPaid: Optional[bool] = None
+    isCancelled: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/matches")
+def list_matches() -> list[dict[str, Any]]:
     with get_session() as session:
         matches = session.exec(select(Match).order_by(Match.created_at.desc())).all()
-        view = []
+        out = []
         for m in matches:
-            view.append(
+            out.append(
                 {
                     "id": m.id,
                     "title": m.title,
-                    "match_type": m.match_type.value,
+                    "matchType": m.match_type.value,
                     "capacity": m.capacity,
-                    "is_open": m.is_open,
-                    "count_active": _count_active_signups(session, m.id),
+                    "isOpen": bool(m.is_open),
+                    "scheduledAt": m.scheduled_at.isoformat() if m.scheduled_at else None,
+                    "createdAt": m.created_at.isoformat(),
+                    "joinCode": m.join_code,
+                    "countActive": _count_active_signups(session, m.id),
                 }
             )
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        {"matches": view, "flash": _flash_from_request(request)},
-    )
+        return out
 
 
-@app.get("/matches/new", response_class=HTMLResponse)
-def match_new(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "match_new.html", {"flash": _flash_from_request(request)})
-
-
-@app.post("/matches/new")
-def match_new_post(
-    title: str = Form(...),
-    match_type: MatchType = Form(...),
-    scheduled_at: str = Form(""),
-) -> RedirectResponse:
-    sched = _parse_scheduled_at(scheduled_at)
-    cap = capacity_for(match_type)
-
+@app.post("/api/matches", status_code=201)
+def create_match(payload: MatchCreateIn) -> dict[str, Any]:
     with get_session() as session:
-        code = _new_join_code()
-        # Garantizar unicidad
-        while session.exec(select(Match).where(Match.join_code == code)).first():
-            code = _new_join_code()
-
+        cap = capacity_for(payload.matchType)
         m = Match(
-            title=title.strip(),
-            match_type=match_type,
+            title=payload.title.strip(),
+            match_type=payload.matchType,
             capacity=cap,
-            scheduled_at=sched,
-            join_code=code,
+            scheduled_at=_parse_scheduled_at(payload.scheduledAt),
+            join_code=_new_join_code(session),
             is_open=True,
         )
         session.add(m)
         session.commit()
         session.refresh(m)
-        match_id = m.id
+        return {
+            "id": m.id,
+            "title": m.title,
+            "matchType": m.match_type.value,
+            "capacity": m.capacity,
+            "isOpen": bool(m.is_open),
+            "scheduledAt": m.scheduled_at.isoformat() if m.scheduled_at else None,
+            "createdAt": m.created_at.isoformat(),
+            "joinCode": m.join_code,
+            "countActive": 0,
+        }
 
-    return RedirectResponse(url=f"/matches/{match_id}?flash=Partido+creado", status_code=303)
 
-
-@dataclass
-class SignupView:
-    id: int
-    player_name: str
-    is_paid: bool
-    is_cancelled: bool
-    notes: Optional[str]
-
-
-@app.get("/matches/{match_id}", response_class=HTMLResponse)
-def match_detail(request: Request, match_id: int) -> HTMLResponse:
+@app.get("/api/matches/{match_id}")
+def get_match(match_id: int) -> dict[str, Any]:
     with get_session() as session:
-        match = session.get(Match, match_id)
-        if not match:
-            return templates.TemplateResponse(
-                request, "index.html", {"matches": [], "flash": "Partido no encontrado"}
-            )
+        m = session.get(Match, match_id)
+        if not m:
+            raise HTTPException(status_code=404, detail="Match no encontrado")
 
         signups = session.exec(select(Signup).where(Signup.match_id == match_id).order_by(Signup.joined_at.asc())).all()
-        players_by_id = {
-            p.id: p for p in session.exec(select(Player).where(Player.id.in_([s.player_id for s in signups]))).all()
-        } if signups else {}
-
-        view_signups: list[dict[str, Any]] = []
-        for s in signups:
-            p = players_by_id.get(s.player_id)
-            view_signups.append(
-                {
-                    "id": s.id,
-                    "player_name": p.name if p else f"Player #{s.player_id}",
-                    "is_paid": bool(s.is_paid),
-                    "is_cancelled": bool(s.is_cancelled),
-                    "notes": s.notes,
-                }
-            )
-
-        count_active = len([s for s in signups if not s.is_cancelled])
-        join_url = f"{request.base_url}join/{match.join_code}"
-        whatsapp_text = _render_whatsapp_text(
-            match.title, match.match_type, match.capacity, view_signups, join_url=join_url
-        )
-
-    return templates.TemplateResponse(
-        request,
-        "match_detail.html",
-        {
-            "match": match,
-            "signups": view_signups,
-            "count_active": count_active,
-            "whatsapp_text": whatsapp_text,
-            "join_url": join_url,
-            "flash": _flash_from_request(request),
-        },
-    )
+        return {
+            "id": m.id,
+            "title": m.title,
+            "matchType": m.match_type.value,
+            "capacity": m.capacity,
+            "isOpen": bool(m.is_open),
+            "scheduledAt": m.scheduled_at.isoformat() if m.scheduled_at else None,
+            "createdAt": m.created_at.isoformat(),
+            "joinCode": m.join_code,
+            "countActive": len([s for s in signups if not s.is_cancelled]),
+            "signups": [_signup_view(session, s) for s in signups],
+        }
 
 
-@app.get("/join/{join_code}", response_class=HTMLResponse)
-def join_get(request: Request, join_code: str) -> HTMLResponse:
+@app.post("/api/matches/{match_id}/toggle-open")
+def toggle_match_open(match_id: int) -> dict[str, Any]:
     with get_session() as session:
-        match = session.exec(select(Match).where(Match.join_code == join_code)).first()
-        if not match:
-            return templates.TemplateResponse(
-                request, "index.html", {"matches": [], "flash": "Partido no encontrado"}
-            )
-
-        signups = session.exec(
-            select(Signup).where(Signup.match_id == match.id).order_by(Signup.joined_at.asc())
-        ).all()
-        players_by_id = (
-            {p.id: p for p in session.exec(select(Player).where(Player.id.in_([s.player_id for s in signups]))).all()}
-            if signups
-            else {}
-        )
-
-        view_signups: list[dict[str, Any]] = []
-        for s in signups:
-            p = players_by_id.get(s.player_id)
-            view_signups.append(
-                {
-                    "id": s.id,
-                    "player_name": p.name if p else f"Player #{s.player_id}",
-                    "is_cancelled": bool(s.is_cancelled),
-                }
-            )
-        count_active = len([s for s in signups if not s.is_cancelled])
-
-    return templates.TemplateResponse(
-        request,
-        "join.html",
-        {
-            "match": match,
-            "signups": view_signups,
-            "count_active": count_active,
-            "flash": _flash_from_request(request),
-        },
-    )
-
-
-@app.post("/join/{join_code}")
-def join_post(join_code: str, name: str = Form(...)) -> RedirectResponse:
-    with get_session() as session:
-        match = session.exec(select(Match).where(Match.join_code == join_code)).first()
-        if not match:
-            return RedirectResponse(url="/?flash=Partido+no+encontrado", status_code=303)
-        if not match.is_open:
-            return RedirectResponse(url=f"/join/{join_code}?flash=Lista+cerrada", status_code=303)
-        active = _count_active_signups(session, match.id)
-        if active >= match.capacity:
-            return RedirectResponse(url=f"/join/{join_code}?flash=Cupo+completo", status_code=303)
-
-        player = _get_or_create_player(session, name=name.strip())
-        existing = session.exec(select(Signup).where(Signup.match_id == match.id, Signup.player_id == player.id)).first()
-        if existing and not existing.is_cancelled:
-            return RedirectResponse(url=f"/join/{join_code}?flash=Ya+estas+apuntado", status_code=303)
-        if existing and existing.is_cancelled:
-            existing.is_cancelled = False
-            existing.cancelled_at = None
-            session.add(existing)
-            session.commit()
-            return RedirectResponse(url=f"/join/{join_code}?flash=Listo,+reincorporado", status_code=303)
-
-        session.add(Signup(match_id=match.id, player_id=player.id))
-        session.commit()
-
-    return RedirectResponse(url=f"/join/{join_code}?flash=Listo,+estas+en+la+lista", status_code=303)
-
-
-@app.post("/matches/{match_id}/toggle-open")
-def match_toggle_open(match_id: int) -> RedirectResponse:
-    with get_session() as session:
-        match = session.get(Match, match_id)
-        if not match:
-            return RedirectResponse(url="/?flash=Partido+no+encontrado", status_code=303)
-        match.is_open = not match.is_open
-        session.add(match)
-        session.commit()
-    return RedirectResponse(url=f"/matches/{match_id}", status_code=303)
-
-
-@app.post("/matches/{match_id}/add")
-def match_add_player(
-    match_id: int,
-    name: str = Form(...),
-    notes: str = Form(""),
-) -> RedirectResponse:
-    with get_session() as session:
-        match = session.get(Match, match_id)
-        if not match:
-            return RedirectResponse(url="/?flash=Partido+no+encontrado", status_code=303)
-
-        active = _count_active_signups(session, match_id)
-        if active >= match.capacity:
-            return RedirectResponse(url=f"/matches/{match_id}?flash=Cupo+completo", status_code=303)
-
-        player = _get_or_create_player(session, name=name.strip())
-
-        existing = session.exec(
-            select(Signup).where(Signup.match_id == match_id, Signup.player_id == player.id)
-        ).first()
-        if existing and not existing.is_cancelled:
-            return RedirectResponse(url=f"/matches/{match_id}?flash=Ya+estaba+en+la+lista", status_code=303)
-        if existing and existing.is_cancelled:
-            existing.is_cancelled = False
-            existing.cancelled_at = None
-            if notes.strip():
-                existing.notes = notes.strip()
-            session.add(existing)
-            session.commit()
-            return RedirectResponse(url=f"/matches/{match_id}?flash=Reincorporado", status_code=303)
-
-        s = Signup(match_id=match_id, player_id=player.id, notes=(notes.strip() or None))
-        session.add(s)
-        session.commit()
-
-    return RedirectResponse(url=f"/matches/{match_id}", status_code=303)
-
-
-@app.post("/signups/{signup_id}/toggle-paid")
-def signup_toggle_paid(signup_id: int) -> RedirectResponse:
-    with get_session() as session:
-        s = session.get(Signup, signup_id)
-        if not s:
-            return RedirectResponse(url="/?flash=Inscripcion+no+encontrada", status_code=303)
-        s.is_paid = not bool(s.is_paid)
-        s.paid_at = datetime.utcnow() if s.is_paid else None
-        session.add(s)
-        session.commit()
-        match_id = s.match_id
-    return RedirectResponse(url=f"/matches/{match_id}", status_code=303)
-
-
-@app.post("/signups/{signup_id}/toggle-cancel")
-def signup_toggle_cancel(signup_id: int) -> RedirectResponse:
-    with get_session() as session:
-        s = session.get(Signup, signup_id)
-        if not s:
-            return RedirectResponse(url="/?flash=Inscripcion+no+encontrada", status_code=303)
-        s.is_cancelled = not bool(s.is_cancelled)
-        s.cancelled_at = datetime.utcnow() if s.is_cancelled else None
-        session.add(s)
-        session.commit()
-        match_id = s.match_id
-    return RedirectResponse(url=f"/matches/{match_id}", status_code=303)
-
-
-@app.get("/parse", response_class=HTMLResponse)
-def parse_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "parse.html", {"flash": _flash_from_request(request)})
-
-
-@app.post("/parse")
-def parse_post(
-    title: str = Form(...),
-    match_type: MatchType = Form(...),
-    start_marker: str = Form("LISTA"),
-    chat_text: str = Form(...),
-) -> RedirectResponse:
-    cap = capacity_for(match_type)
-    messages = parse_whatsapp_export(chat_text)
-    roster = build_roster_from_messages(messages, start_marker=start_marker, capacity=cap)
-
-    with get_session() as session:
-        code = _new_join_code()
-        while session.exec(select(Match).where(Match.join_code == code)).first():
-            code = _new_join_code()
-
-        m = Match(
-            title=title.strip(),
-            match_type=match_type,
-            capacity=cap,
-            scheduled_at=None,
-            join_code=code,
-            is_open=True,
-        )
+        m = session.get(Match, match_id)
+        if not m:
+            raise HTTPException(status_code=404, detail="Match no encontrado")
+        m.is_open = not bool(m.is_open)
         session.add(m)
         session.commit()
         session.refresh(m)
-        match_id = m.id
+        return {"id": m.id, "isOpen": bool(m.is_open)}
 
-        for name in roster:
-            p = _get_or_create_player(session, name=name.strip(), whatsapp_display_name=name.strip())
-            existing = session.exec(select(Signup).where(Signup.match_id == m.id, Signup.player_id == p.id)).first()
-            if existing:
-                continue
-            session.add(Signup(match_id=m.id, player_id=p.id))
+
+@app.post("/api/matches/{match_id}/signups", status_code=201)
+def create_signup(match_id: int, payload: SignupCreateIn) -> dict[str, Any]:
+    with get_session() as session:
+        m = session.get(Match, match_id)
+        if not m:
+            raise HTTPException(status_code=404, detail="Match no encontrado")
+
+        active = _count_active_signups(session, match_id)
+        if active >= m.capacity:
+            raise HTTPException(status_code=409, detail="Cupo completo")
+
+        player = _get_or_create_player(session, name=payload.name.strip())
+        existing = session.exec(select(Signup).where(Signup.match_id == match_id, Signup.player_id == player.id)).first()
+        if existing and not existing.is_cancelled:
+            raise HTTPException(status_code=409, detail="Ya estaba en la lista")
+        if existing and existing.is_cancelled:
+            existing.is_cancelled = False
+            existing.cancelled_at = None
+            if payload.notes is not None:
+                existing.notes = payload.notes.strip() or None
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+            return _signup_view(session, existing)
+
+        s = Signup(match_id=match_id, player_id=player.id, notes=(payload.notes.strip() if payload.notes else None))
+        session.add(s)
         session.commit()
+        session.refresh(s)
+        return _signup_view(session, s)
 
-    msg = f"Creado+con+{len(roster)}+apuntados+(de+{cap})"
-    return RedirectResponse(url=f"/matches/{match_id}?flash={msg}", status_code=303)
+
+@app.patch("/api/signups/{signup_id}")
+def patch_signup(signup_id: int, payload: SignupPatchIn) -> dict[str, Any]:
+    with get_session() as session:
+        s = session.get(Signup, signup_id)
+        if not s:
+            raise HTTPException(status_code=404, detail="Signup no encontrado")
+
+        if payload.isPaid is not None:
+            s.is_paid = bool(payload.isPaid)
+            s.paid_at = datetime.utcnow() if s.is_paid else None
+        if payload.isCancelled is not None:
+            s.is_cancelled = bool(payload.isCancelled)
+            s.cancelled_at = datetime.utcnow() if s.is_cancelled else None
+        if payload.notes is not None:
+            s.notes = payload.notes.strip() or None
+
+        session.add(s)
+        session.commit()
+        session.refresh(s)
+        return _signup_view(session, s)
 
 
-@app.get("/analytics", response_class=HTMLResponse)
-def analytics(request: Request) -> HTMLResponse:
+@app.get("/api/analytics")
+def analytics() -> list[dict[str, Any]]:
     with get_session() as session:
         players = session.exec(select(Player).order_by(Player.name.asc())).all()
-        rows = []
+        rows: list[dict[str, Any]] = []
         for p in players:
             signups = session.exec(select(Signup).where(Signup.player_id == p.id)).all()
             total = len(signups)
@@ -420,26 +287,153 @@ def analytics(request: Request) -> HTMLResponse:
 
             cancel_rate = cancels / total
             pay_rate = paid / total
-
-            # Riesgo simple 0-100 (más cancelaciones + menos pago => más riesgo)
             risk = round(100 * (0.7 * cancel_rate + 0.3 * (1 - pay_rate)))
             risk = max(0, min(100, int(risk)))
 
             rows.append(
                 {
+                    "playerId": p.id,
                     "name": p.name,
                     "total": total,
-                    "cancel_rate": f"{round(cancel_rate * 100)}%",
-                    "pay_rate": f"{round(pay_rate * 100)}%",
+                    "cancelRate": cancel_rate,
+                    "payRate": pay_rate,
                     "risk": risk,
                 }
             )
+        rows.sort(key=lambda r: (r["risk"], r["total"]), reverse=True)
+        return rows
 
-    # Orden: riesgo desc, luego total desc
-    rows.sort(key=lambda r: (r["risk"], r["total"]), reverse=True)
-    return templates.TemplateResponse(
-        request,
-        "analytics.html",
-        {"rows": rows, "flash": _flash_from_request(request)},
-    )
+
+# --- WhatsApp Business Cloud Webhook (tiempo real vía bot 1:1) ---
+#
+# IMPORTANT: La API oficial NO permite “leer mensajes de un grupo normal”.
+# Esto funciona para chats con el número Business (bot).
+
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")  # opcional (firma)
+
+
+def _verify_meta_signature(request: Request, body_bytes: bytes) -> None:
+    if not WHATSAPP_APP_SECRET:
+        return
+    sig = request.headers.get("X-Hub-Signature-256") or ""
+    if not sig.startswith("sha256="):
+        raise HTTPException(status_code=401, detail="Missing signature")
+    expected = "sha256=" + hmac.new(WHATSAPP_APP_SECRET.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(status_code=401, detail="Bad signature")
+
+
+@app.get("/webhooks/whatsapp")
+def whatsapp_verify(request: Request) -> Any:
+    qp = request.query_params
+    mode = qp.get("hub.mode")
+    token = qp.get("hub.verify_token")
+    challenge = qp.get("hub.challenge")
+    if mode == "subscribe" and token and token == WHATSAPP_VERIFY_TOKEN and challenge:
+        return JSONResponse(content=int(challenge))
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+_JOIN_RE = re.compile(r"(?i)\\b(?:join|apunto|me\\s*apunto|lista)\\s+([0-9a-f]{8})\\b|\\b([0-9a-f]{8})\\s*(?:\\+1|join|apunto)\\b")
+
+
+def _extract_join_code(text: str) -> Optional[str]:
+    m = _JOIN_RE.search(text.strip())
+    if not m:
+        return None
+    return (m.group(1) or m.group(2) or "").lower() or None
+
+
+@app.post("/webhooks/whatsapp")
+async def whatsapp_webhook(request: Request) -> dict[str, str]:
+    body = await request.body()
+    _verify_meta_signature(request, body)
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad JSON: {e}") from e
+
+    # Cloud API shape: entry[].changes[].value.messages[]
+    messages: list[dict[str, Any]] = []
+    for entry in payload.get("entry", []) or []:
+        for change in entry.get("changes", []) or []:
+            value = change.get("value") or {}
+            for msg in value.get("messages", []) or []:
+                messages.append({"msg": msg, "value": value})
+
+    # Procesamos solo texto por ahora
+    processed = 0
+    for item in messages:
+        msg = item["msg"]
+        if msg.get("type") != "text":
+            continue
+        text = ((msg.get("text") or {}).get("body") or "").strip()
+        join_code = _extract_join_code(text) or _extract_join_code(text.replace("+1", " +1 "))
+        if not join_code:
+            continue
+
+        from_phone = msg.get("from")  # formato: "54911...."
+        profile = ((item["value"].get("contacts") or [{}])[0].get("profile") or {})
+        display_name = profile.get("name")
+        name = display_name or (from_phone or "Jugador")
+
+        with get_session() as session:
+            match = session.exec(select(Match).where(Match.join_code == join_code)).first()
+            if not match or not match.is_open:
+                continue
+            if _count_active_signups(session, match.id) >= match.capacity:
+                continue
+
+            player = _get_or_create_player(session, name=name, phone=from_phone, whatsapp_display_name=display_name)
+            existing = session.exec(
+                select(Signup).where(Signup.match_id == match.id, Signup.player_id == player.id)
+            ).first()
+            if existing and not existing.is_cancelled:
+                continue
+            if existing and existing.is_cancelled:
+                existing.is_cancelled = False
+                existing.cancelled_at = None
+                session.add(existing)
+                session.commit()
+            else:
+                session.add(Signup(match_id=match.id, player_id=player.id))
+                session.commit()
+
+        processed += 1
+
+    return {"status": "ok", "processed": str(processed)}
+
+
+# --- Servir React build (si existe) ---
+DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+ASSETS_DIR = DIST_DIR / "assets"
+
+if ASSETS_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
+
+
+@app.get("/")
+def serve_root() -> Any:
+    index = DIST_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
+    return {"message": "Backend listo. Ejecutá el frontend React en /frontend."}
+
+
+@app.get("/{path:path}")
+def serve_spa(path: str) -> Any:
+    # No interceptar API/webhooks
+    if path.startswith("api") or path.startswith("webhooks"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Archivos estáticos en dist (favicon, etc)
+    candidate = DIST_DIR / path
+    if candidate.exists() and candidate.is_file():
+        return FileResponse(str(candidate))
+
+    index = DIST_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
+    raise HTTPException(status_code=404, detail="Frontend no construido (npm run build)")
 
