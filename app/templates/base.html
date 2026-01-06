@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}Reservas Fútbol{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="container">
+        <div class="brand"><a href="/">Reservas Fútbol</a></div>
+        <nav class="nav">
+          <a href="/matches/new">Crear partido</a>
+          <a href="/parse">Modo WhatsApp</a>
+          <a href="/analytics">Analíticas</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="container">
+      {% if flash %}
+        <div class="flash">{{ flash }}</div>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>
+

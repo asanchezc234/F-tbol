@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Partidos | Reservas Fútbol{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <h1>Partidos</h1>
+    <div class="actions">
+      <a class="btn" href="/matches/new">+ Crear partido</a>
+      <a class="btn secondary" href="/parse">Pegar chat (WhatsApp)</a>
+    </div>
+  </div>
+
+  {% if matches|length == 0 %}
+    <p class="muted">Todavía no hay partidos.</p>
+  {% else %}
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Título</th>
+            <th>Tipo</th>
+            <th>Cupo</th>
+            <th>Apuntados</th>
+            <th>Estado</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in matches %}
+            <tr>
+              <td>{{ m.title }}</td>
+              <td>{{ m.match_type }}</td>
+              <td>{{ m.capacity }}</td>
+              <td>{{ m.count_active }}/{{ m.capacity }}</td>
+              <td>
+                {% if m.is_open %}<span class="pill ok">Abierto</span>{% else %}<span class="pill warn">Cerrado</span>{% endif %}
+              </td>
+              <td><a href="/matches/{{ m.id }}">Abrir</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endblock %}
+
