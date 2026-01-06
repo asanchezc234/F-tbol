@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Crear partido | Reservas Fútbol{% endblock %}
+
+{% block content %}
+  <h1>Crear partido</h1>
+
+  <div class="card">
+    <form method="post" action="/matches/new">
+      <div class="grid">
+        <label>
+          <div class="label">Título</div>
+          <input name="title" placeholder="Ej: Martes 22:00 (Cancha X)" required />
+        </label>
+
+        <label>
+          <div class="label">Tipo</div>
+          <select name="match_type" required>
+            <option value="fut5">fut5 (10)</option>
+            <option value="fut6">fut6 (12)</option>
+            <option value="fut7">fut7 (14)</option>
+          </select>
+        </label>
+
+        <label>
+          <div class="label">Fecha y hora (opcional)</div>
+          <input name="scheduled_at" placeholder="2026-01-06 21:00" />
+          <div class="help">Formato: YYYY-MM-DD HH:MM</div>
+        </label>
+      </div>
+
+      <div class="actions">
+        <button class="btn" type="submit">Crear</button>
+        <a class="btn secondary" href="/">Cancelar</a>
+      </div>
+    </form>
+  </div>
+{% endblock %}
+

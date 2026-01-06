@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Modo WhatsApp | Reservas Fútbol{% endblock %}
+
+{% block content %}
+  <h1>Modo WhatsApp (pegar chat)</h1>
+  <p class="muted">
+    Pegá acá el texto exportado/copiado del grupo. La app buscará el mensaje que contenga el marcador
+    (por defecto “LISTA”) y agregará a los que respondan “me apunto / +1 / voy / yo…”, hasta completar cupo.
+  </p>
+
+  <div class="card">
+    <form method="post" action="/parse">
+      <div class="grid">
+        <label>
+          <div class="label">Título del partido</div>
+          <input name="title" placeholder="Ej: Jueves 21:30 (Cancha 2)" required />
+        </label>
+        <label>
+          <div class="label">Tipo</div>
+          <select name="match_type" required>
+            <option value="fut5">fut5 (10)</option>
+            <option value="fut6">fut6 (12)</option>
+            <option value="fut7">fut7 (14)</option>
+          </select>
+        </label>
+        <label>
+          <div class="label">Marcador de inicio</div>
+          <input name="start_marker" value="LISTA" />
+          <div class="help">Ej: “LISTA”, “/lista”, “Arranco lista”.</div>
+        </label>
+      </div>
+
+      <label>
+        <div class="label">Chat (texto)</div>
+        <textarea name="chat_text" rows="14" placeholder="Pegá acá el export/copia del chat…" required></textarea>
+      </label>
+
+      <div class="actions">
+        <button class="btn" type="submit">Crear partido + armar lista</button>
+        <a class="btn secondary" href="/">Volver</a>
+      </div>
+    </form>
+  </div>
+{% endblock %}
+

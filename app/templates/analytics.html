@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Analíticas | Reservas Fútbol{% endblock %}
+
+{% block content %}
+  <h1>Analíticas</h1>
+  <p class="muted">Métricas simples basadas en el histórico de inscripciones (pagos y cancelaciones).</p>
+
+  {% if rows|length == 0 %}
+    <p class="muted">No hay datos todavía.</p>
+  {% else %}
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Jugador</th>
+            <th>Partidos</th>
+            <th>% cancelación</th>
+            <th>% pago</th>
+            <th>Riesgo (0–100)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+            <tr>
+              <td>{{ r.name }}</td>
+              <td>{{ r.total }}</td>
+              <td>{{ r.cancel_rate }}</td>
+              <td>{{ r.pay_rate }}</td>
+              <td>
+                {% if r.risk >= 70 %}
+                  <span class="pill danger">Alto {{ r.risk }}</span>
+                {% elif r.risk >= 40 %}
+                  <span class="pill warn">Medio {{ r.risk }}</span>
+                {% else %}
+                  <span class="pill ok">Bajo {{ r.risk }}</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endblock %}
+

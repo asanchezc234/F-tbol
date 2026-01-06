@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Apuntarse | Reservas Fútbol{% endblock %}
+
+{% block content %}
+  <h1>Apuntarse</h1>
+  <p class="muted">Partido: <b>{{ match.title }}</b> · Cupo: <b>{{ count_active }}/{{ match.capacity }}</b></p>
+
+  <div class="card">
+    {% if not match.is_open %}
+      <p class="warntext">La lista está cerrada.</p>
+    {% endif %}
+    {% if count_active >= match.capacity %}
+      <p class="warntext">Cupo completo.</p>
+    {% endif %}
+
+    <form method="post" action="/join/{{ match.join_code }}">
+      <label>
+        <div class="label">Tu nombre</div>
+        <input name="name" placeholder="Ej: Juan" required />
+      </label>
+      <div class="actions">
+        <button class="btn" type="submit">Me apunto</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Lista actual</h2>
+    {% if signups|length == 0 %}
+      <p class="muted">Todavía no hay apuntados.</p>
+    {% else %}
+      <ol>
+        {% for s in signups %}
+          <li class="{% if s.is_cancelled %}muted{% endif %}">
+            {{ s.player_name }}{% if s.is_cancelled %} (canceló){% endif %}
+          </li>
+        {% endfor %}
+      </ol>
+    {% endif %}
+  </div>
+{% endblock %}
+

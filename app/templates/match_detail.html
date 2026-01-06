@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}{{ match.title }} | Reservas Fútbol{% endblock %}
+
+{% block content %}
+  <div class="row">
+    <div>
+      <h1>{{ match.title }}</h1>
+      <p class="muted">
+        Tipo: <b>{{ match.match_type }}</b> · Cupo: <b>{{ match.capacity }}</b> ·
+        Apuntados: <b>{{ count_active }}/{{ match.capacity }}</b>
+      </p>
+      {% if match.scheduled_at %}
+        <p class="muted">Fecha/hora: <b>{{ match.scheduled_at }}</b></p>
+      {% endif %}
+    </div>
+    <div class="actions">
+      <form method="post" action="/matches/{{ match.id }}/toggle-open">
+        {% if match.is_open %}
+          <button class="btn secondary" type="submit">Cerrar lista</button>
+        {% else %}
+          <button class="btn" type="submit">Reabrir lista</button>
+        {% endif %}
+      </form>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>Agregar jugador</h2>
+      <form method="post" action="/matches/{{ match.id }}/add">
+        <label>
+          <div class="label">Nombre</div>
+          <input name="name" placeholder="Ej: Juan" required />
+        </label>
+        <label>
+          <div class="label">Nota (opcional)</div>
+          <input name="notes" placeholder="Ej: paga por bizum" />
+        </label>
+        <div class="actions">
+          <button class="btn" type="submit">Agregar</button>
+        </div>
+      </form>
+      {% if not match.is_open %}
+        <p class="muted">La lista está cerrada (igual podés agregar manualmente).</p>
+      {% endif %}
+      {% if count_active >= match.capacity %}
+        <p class="warntext">Cupo completo.</p>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Link para apuntarse</h2>
+      <p class="muted">Compartilo en el grupo (o en el texto de lista).</p>
+      <input value="{{ join_url }}" readonly />
+
+      <h2>Texto para WhatsApp</h2>
+      <p class="muted">Copiá y pegá este mensaje en el grupo.</p>
+      <textarea rows="8" readonly>{{ whatsapp_text }}</textarea>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Lista</h2>
+    {% if signups|length == 0 %}
+      <p class="muted">No hay apuntados todavía.</p>
+    {% else %}
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Jugador</th>
+            <th>Pago</th>
+            <th>Canceló</th>
+            <th>Nota</th>
+            <th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in signups %}
+            <tr class="{% if s.is_cancelled %}row-cancelled{% endif %}">
+              <td>{{ loop.index }}</td>
+              <td>{{ s.player_name }}</td>
+              <td>
+                {% if s.is_paid %}
+                  <span class="pill ok">Pagó</span>
+                {% else %}
+                  <span class="pill warn">Debe</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if s.is_cancelled %}
+                  <span class="pill warn">Sí</span>
+                {% else %}
+                  <span class="pill ok">No</span>
+                {% endif %}
+              </td>
+              <td class="muted">{{ s.notes or "" }}</td>
+              <td class="actions-inline">
+                <form method="post" action="/signups/{{ s.id }}/toggle-paid">
+                  <button class="btn small secondary" type="submit">
+                    {% if s.is_paid %}Desmarcar pago{% else %}Marcar pago{% endif %}
+                  </button>
+                </form>
+                <form method="post" action="/signups/{{ s.id }}/toggle-cancel">
+                  <button class="btn small danger" type="submit">
+                    {% if s.is_cancelled %}Deshacer cancel{% else %}Cancelar{% endif %}
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+{% endblock %}
+
